@@ -19,7 +19,7 @@
 </p>
 
 
-## 📝 Table of Contents
+## Table of Contents
 + [1. Overview](#overview)
 + [2. PC Setup](#pc_setup)
 + [3. ROS Setup](#ros_setup)
@@ -28,19 +28,19 @@
 + [6. Projects](#projects)
 
 
-## 🏁 1. Overview <a name = "overview"></a>
+## 1. Overview <a name = "overview"></a>
 &emsp;.
 
 &emsp;. This is a [demo video](https://youtu.be/F-Cr1E8kr7c ) 
 
 
-## 💾 2. Environment Setup <a name = "pc_setup"></a>
+## 2. Environment Setup <a name = "pc_setup"></a>
 ### 2.1 PC Setup
 #### 2.1.1 Personal PC Setup
 
 #### 2.1.2 Raspberry PI Setup
 
-## 🚀 3. ROS Setup <a name = "ros_setup"></a>
+## 3. ROS Setup <a name = "ros_setup"></a>
 ROS(Robot Operating System) is a popular framework for building the software for robot now adays, which we will also use it to build our Robot.
 
-## ✍️ 4. Notes <a name = "notes"></a>
+## 4. Notes <a name = "notes"></a>
