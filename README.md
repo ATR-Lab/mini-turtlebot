@@ -3,7 +3,7 @@
  <img src="resources/images/ATR-logo.gif" alt="ATR"></a>
 </p>
 
-<h3 align="center">Micro TurtleBot Project</h3>
+<h3 align="center">Mini TurtleBot Project</h3>
 
 <div align="center">
 
@@ -15,7 +15,7 @@
 
 ---
 
-<p align="center"> this repo contains the steps for setup your environment and necessary source code for the micro TurtleBot development
+<p align="center"> this repo contains the steps for setup your environment and necessary source code for the Mini TurtleBot development
 </p>
 
 
