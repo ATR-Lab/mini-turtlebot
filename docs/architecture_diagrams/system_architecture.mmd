@@ -1,0 +1,36 @@
+```mermaid
+flowchart LR
+  subgraph Robot[Pico‑W Robot]
+    CAM[Camera Sensor Frame Buffer]
+    VISION[Vision module]
+    MJPEG[HTTP MJPEG Stream :8080]
+    CTRL[Control JSONL TCP :9000]
+    LIDAR[LiDAR UDP :5601]
+    MOTOR[Motor Mgmt]
+    LOC[On‑Robot Localization]
+    BATT[Battery Mgmt]
+    CFG[Config]
+    CAM --> VISION --> MJPEG
+    CTRL --> MOTOR
+  end
+
+  subgraph Ground[PC / Ground Station]
+    DRV[TB_Driver]
+    CAMC[TB_CAM_Client]
+    LIDC[TB_LiDAR_Client]
+    EKF[TB_Localization (EKF)]
+    NAV2[Nav2 / SLAM]
+    DRV -. TCP .-> CTRL
+    CAMC -. HTTP .-> MJPEG
+    LIDC -. UDP .-> LIDAR
+    EKF --> NAV2
+  end
+
+  subgraph Scratch[Scratch + ATR Bridge]
+    PCMIC[Voice Cmd (PC mic)]
+    ATR[ATR Bridge (WebSocket)]
+  end
+
+  PCMIC --> ATR --> DRV
+  note1{{Robot audio (ADC→Audio Stream→TB_AUDIO_Client) is ROS‑only; not connected to Scratch.}}
+```
