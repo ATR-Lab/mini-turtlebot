@@ -1,3 +1,23 @@
+<p align="center">
+  <a href="" rel="noopener">
+ <img src="resources/images/ATR-logo.gif" alt="ATR"></a>
+</p>
+
+<h3 align="center">ATR Mini TurtleBot</h3>
+
+<div align="center">
+
+  [![Status](https://img.shields.io/badge/status-active-success.svg)]() 
+  [![build](https://img.shields.io/badge/build-melodic-green)]()
+  [![License](https://img.shields.io/badge/license-MIT-blue.svg)](/LICENSE)
+
+</div>
+
+---
+
+<p align="center"> this repo contains the steps for setup your environment and necessary source code for the Mini TurtleBot development
+</p>
+
 # Mini TurtleBot
 
 A complete scaffold for the **MiniTurtleBot**:
