@@ -1,0 +1,5 @@
+# EKF parameters (stub). Replace with robot_localization or your filter.
+frequency: 30.0
+two_d_mode: true
+publish_tf: false
+sensor_timeout: 0.1

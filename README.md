@@ -1,46 +1,18 @@
-<p align="center">
-  <a href="" rel="noopener">
- <img src="resources/images/ATR-logo.gif" alt="ATR"></a>
-</p>
+# MiniTurtleBot — Reference Repository
 
-<h3 align="center">Mini TurtleBot Project</h3>
+A complete scaffold for the **MiniTurtleBot** architecture described in your paper/diagram:
 
-<div align="center">
+- **Robot (Pico‑W, single radio):** drives motors, reads IMU/IR/encoders and hosts three lightweight network services:
+  - **:8080** — MJPEG Stream Server (SPI/I²C camera in Turtle‑Head)
+  - **:5601** — LiDAR UDP Server (newline‑delimited JSON scans)
+  - **:9000** — Control TCP JSONL Server (one JSON object per line)
+- **Ground Station (ROS 2):** modules:
+  - `tb_driver` (connects to :9000)
+  - `tb_cam_client` (MJPEG‑only camera client)
+  - `tb_lidar_client` (UDP scan parser → `sensor_msgs/LaserScan`)
+  - `tb_localization` (EKF stub; plug into Nav2/SLAM as needed)
+  - `tb_bringup` (launch file to start the above)
+- **Scratch / ATR Bridge:** Scratch 3 extension + WebSocket bridge to ROS 2.  
+  **Voice Cmd uses the PC microphone** → ATR bridge → ROS. **Robot audio (ADC→Audio Stream→TB_AUDIO_Client) is ROS‑only and not connected to Scratch**.
 
-  [![Status](https://img.shields.io/badge/status-active-success.svg)]() 
-  [![build](https://img.shields.io/badge/build-melodic-green)]()
-  [![License](https://img.shields.io/badge/license-MIT-blue.svg)](/LICENSE)
-
-</div>
-
----
-
-<p align="center"> this repo contains the steps for setup your environment and necessary source code for the Mini TurtleBot development
-</p>
-
-
-## Table of Contents
-+ [1. Overview](#overview)
-+ [2. PC Setup](#pc_setup)
-+ [3. ROS Setup](#ros_setup)
-+ [4. Notes](#notes)
-+ [5. Assignments](#assignments)
-+ [6. Projects](#projects)
-
-
-## 1. Overview <a name = "overview"></a>
-&emsp;.
-
-&emsp;. This is a [demo video](https://youtu.be/F-Cr1E8kr7c ) 
-
-
-## 2. Environment Setup <a name = "pc_setup"></a>
-### 2.1 PC Setup
-#### 2.1.1 Personal PC Setup
-
-#### 2.1.2 Raspberry PI Setup
-
-## 3. ROS Setup <a name = "ros_setup"></a>
-ROS(Robot Operating System) is a popular framework for building the software for robot now adays, which we will also use it to build our Robot.
-
-## 4. Notes <a name = "notes"></a>
+This repo focuses on structure, docs, and launch configuration so you can drop in real drivers later.
