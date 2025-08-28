@@ -1,5 +1,7 @@
 # Mechanical Design — Mini TurtleBot
 
+![Mini TurtleBot Assembly](assembly.png)
+
 This folder contains the **3D printable STL files** for the Mini TurtleBot chassis and related components.  
 All parts are designed to be fabricated on a standard FDM 3D printer (e.g., Prusa, Ender, Bambu Lab).  
 
