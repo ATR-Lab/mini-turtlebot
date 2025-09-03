@@ -14,10 +14,11 @@ All parts are designed to be fabricated on a standard FDM 3D printer (e.g., Prus
 | `Frame.stl`           | Main chassis frame that holds the Pico-W board, LiDAR, and mounting points. |
 | `Battery_Base.stl`    | Bottom housing for LiPo battery.                                             |
 | `Battery_Top.stl`     | Top cover/retainer for the battery compartment.                              |
-| `Gear_Wheel.stl`      | Primary drive wheel gear for motor coupling.                                |
+| `Gear_Wheel.stl`      | Use this to print wheel and use TPU for better performance.                                |
 | `Small_Gear12.stl`    | Secondary small gear (12T) for transmission system.                         |
 | `Small_Spacer.stl`    | Spacer for aligning gears/axles.                                            |
 | `Mini_turtle_assembly.bmp` | Assembly illustration for reference (non-printable).                    |
+| `Spur_gear_for_wheel.stl` |  Primary drive wheel gear for motor coupling.                    |
 
 ---
 
