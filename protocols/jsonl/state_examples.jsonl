@@ -1,0 +1,6 @@
+{"v":1,"type":"state","robot_id":"tb_01","state":"heartbeat","uptime_ms":53012,"estop":false}
+{"v":1,"type":"state","robot_id":"tb_01","state":"battery","v_bat":3.98,"pct":71}
+{"v":1,"type":"state","robot_id":"tb_01","state":"odom","x":1.20,"y":-0.30,"theta":0.52,"vx":0.08,"wz":0.00}
+{"v":1,"type":"state","robot_id":"tb_01","state":"imu","ax":0.01,"ay":0.02,"az":9.80,"gx":0.00,"gy":0.00,"gz":0.00}
+{"v":1,"type":"err","robot_id":"tb_01","code":"bad_json","msg":"parse error","ack_seq":12}
+{"v":1,"type":"ack","robot_id":"tb_01","ack_seq":1,"ok":true}

@@ -1,0 +1,8 @@
+{"v":1,"type":"cmd","robot_id":"tb_01","cmd":"ping","seq":1,"src":"cli","priority":8}
+{"v":1,"type":"cmd","robot_id":"tb_01","cmd":"vel","linear":0.10,"angular":0.00,"seq":2,"src":"ros2","priority":4}
+{"v":1,"type":"cmd","robot_id":"tb_01","cmd":"vel","linear":0.00,"angular":0.50,"seq":3,"src":"ros2","priority":4}
+{"v":1,"type":"cmd","robot_id":"tb_01","cmd":"stop","seq":4,"src":"ros2","priority":2}
+{"v":1,"type":"cmd","robot_id":"tb_01","cmd":"led","id":1,"state":true,"seq":5,"src":"scratch","priority":6}
+{"v":1,"type":"cmd","robot_id":"tb_01","cmd":"servo","id":1,"deg":90,"seq":6,"src":"scratch","priority":6}
+{"v":1,"type":"cmd","robot_id":"tb_01","cmd":"estop","enabled":true,"seq":7,"src":"ros2","priority":0}
+{"v":1,"type":"cmd","robot_id":"tb_01","cmd":"estop","enabled":false,"seq":8,"src":"ros2","priority":0}
