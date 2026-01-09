@@ -23,3 +23,7 @@ site/
 ros2_ws/build/
 ros2_ws/install/
 ros2_ws/log/
+
+# VSCode DB anywhere in repo
+**/.vscode/browse.vc.db
+**/.vscode/browse.vc.db-*
