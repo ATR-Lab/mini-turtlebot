@@ -1,0 +1,14 @@
+bool motors
+bool imu
+bool ir
+bool lidar
+bool 360lidar
+float32 motors_hz
+float32 imu_hz
+float32 ir_hz
+float32 lidar_hz
+float32 360lidar_hz
+---
+bool ok
+string message
+

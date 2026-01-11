@@ -1,0 +1,18 @@
+# Enable/disable periodic streaming from TB -> bridge
+bool motors
+bool imu
+bool ir
+bool lidar
+bool lidar360
+
+# Desired publish rates (Hz). If <= 0, TB may pick a default when enabled.
+float32 motors_hz
+float32 imu_hz
+float32 ir_hz
+float32 lidar_hz
+float32 lidar360_hz
+
+---
+bool ok
+string message
+

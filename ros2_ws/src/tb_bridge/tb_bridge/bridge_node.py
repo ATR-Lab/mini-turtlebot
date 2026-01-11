@@ -20,6 +20,7 @@ from typing import Optional
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
+from tb_msgs.srv import SetStreams
 
 import websockets
 
@@ -46,6 +47,15 @@ class TbBridgeNode(Node):
         self.declare_parameter("send_rate_hz", 20.0)      # max send rate
         self.declare_parameter("reconnect_backoff_s", 1.0)
         self.declare_parameter("max_backoff_s", 10.0)
+        self._next_cfg_id = 1
+        self.ws_connected = False
+        self._pending_cfg_json = None
+
+
+
+
+        
+
 
         self.robot_id: str = self.get_parameter("robot_id").value
         self.ws_url: str = self.get_parameter("ws_url").value
@@ -57,6 +67,8 @@ class TbBridgeNode(Node):
         self.send_rate_hz: float = float(self.get_parameter("send_rate_hz").value)
         self.reconnect_backoff_s: float = float(self.get_parameter("reconnect_backoff_s").value)
         self.max_backoff_s: float = float(self.get_parameter("max_backoff_s").value)
+
+        self.srv_set_streams = self.create_service(SetStreams, f'/{self.robot_id}/set_streams', self.on_set_streams)
 
         # --- State ---
         self._seq = 0
@@ -75,6 +87,48 @@ class TbBridgeNode(Node):
         self._ws_thread.start()
 
     # ---------------- ROS callbacks ----------------
+
+    def on_set_streams(self, request, response):
+        cfg_id = self._next_cfg_id
+        self._next_cfg_id += 1
+
+        cmd = {
+            "v": 1,
+            "type": "cfg",
+            "robot_id": self.robot_id,
+            "id": cfg_id,
+            "ts_ms": int(time.time() * 1000),
+            "streams": {
+                "motors": {"en": bool(request.motors), "hz": float(request.motors_hz)},
+                "imu": {"en": bool(request.imu), "hz": float(request.imu_hz)},
+                "ir": {"en": bool(request.ir), "hz": float(request.ir_hz)},
+                "lidar": {"en": bool(request.lidar), "hz": float(request.lidar_hz)},
+            }
+        }
+
+        # If your srv has lidar360 fields, include them too:
+        if hasattr(request, "lidar360") and hasattr(request, "lidar360_hz"):
+            cmd["streams"]["lidar360"] = {"en": bool(request.lidar360), "hz": float(request.lidar360_hz)}
+
+        cmd_json = json.dumps(cmd)
+        self._pending_cfg_json = cmd_json
+
+
+        self.get_logger().info(f"CFG OUT: {cmd_json}")
+
+        response.ok = True
+        response.message = f"built cfg id={cfg_id} (not sent yet)"
+
+        if not self.ws_connected:
+            response.ok = False
+            response.message = "WS not connected; cfg not sent"
+            self.get_logger().warn("CFG NOT SENT: WS not connected")
+            return response
+
+
+        return response
+
+
 
     def _on_cmd_vel(self, msg: Twist) -> None:
         sample = TwistSample(
@@ -158,6 +212,21 @@ class TbBridgeNode(Node):
                     max_size=1_000_000,
                 ) as ws:
                     self.get_logger().info("WebSocket connected")
+
+                    self.ws_connected = True
+                    self.get_logger().info("WebSocket connected")
+
+                    # Send any pending cfg immediately
+                    if self._pending_cfg_json is not None:
+                        try:
+                            await ws.send(self._pending_cfg_json)
+                            self.get_logger().info(f"CFG SENT ON CONNECT: {self._pending_cfg_json}")
+                            # Optionally keep it (or clear it). I recommend clearing:
+                            self._pending_cfg_json = None
+                        except Exception as e:
+                            self.get_logger().warn(f"Failed to send pending cfg on connect: {e}")
+
+
                     backoff = self.reconnect_backoff_s
                     sent_stop_for_timeout = False
 
@@ -211,6 +280,7 @@ class TbBridgeNode(Node):
             except Exception as e:
                 # Expected when robot is offline
                 self.get_logger().warn(f"WebSocket error: {e}. Reconnecting in {backoff:.1f}s")
+                self.ws_connected = False
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 1.5, self.max_backoff_s)
 
