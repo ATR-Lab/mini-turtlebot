@@ -2,44 +2,29 @@
 """
 tb_bridge/bridge_node.py
 
-ROS2 <-> WebSocket JSONL bridge (v0/v1-ish)
-
-ROS -> WS:
+ROS2 -> WebSocket JSONL bridge (v0)
 - Subscribes: /<robot_id>/cmd_vel (geometry_msgs/Twist)
-- Sends WS JSONL frames (one JSON per line, newline terminated)
-- Watchdog: if no cmd_vel for cmd_timeout_ms, sends STOP once
-- Reconnects automatically with backoff
-
-ROS Service -> WS (cfg):
-- Provides: /<robot_id>/set_streams (tb_msgs/srv/SetStreams)
-- Sends WS "cfg" command and waits for WS "ack" (id-matched)
-- If WS not connected: returns ok=False and message includes queued cfg id
-  (cfg is still queued and will send on next connect)
-
-WS -> ROS (receive):
-- Receives WS frames and logs "WS IN: ..."
-- Parses "ack" frames and wakes waiting service calls
-- (Sensor publishing not implemented yet; next step)
-
-Notes:
-- Uses a background thread running an asyncio WS client.
-- ROS callbacks run in the main rclpy thread.
-- Cross-thread send uses a threadsafe Queue (self._tx_queue).
+- Sends WS text frames containing one JSON object per frame (JSON + '\n' for JSONL compatibility)
+- Reconnects automatically
+- Watchdog: if no cmd_vel for cmd_timeout_ms, sends stop once
+- Exposes: /<robot_id>/set_streams (tb_msgs/srv/SetStreams)
+  - Sends/queues a WS "cfg" command to enable/disable sensor streams.
+- Receives WS frames (JSONL) and logs them ("WS IN: ...")
+  - Later: parse ACK + publish sensor topics.
 """
 
 import asyncio
 import json
-import queue
 import threading
 import time
+import queue
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from tb_msgs.srv import SetStreams
-from tb_msgs.msg import MotorState
 
 import websockets
 
@@ -57,7 +42,7 @@ class TbBridgeNode(Node):
 
         # --- Parameters ---
         self.declare_parameter("robot_id", "tb_01")
-        self.declare_parameter("ws_url", "ws://192.168.0.123:9000/ws")
+        self.declare_parameter("ws_url", "ws://192.168.0.123:9000/")
         self.declare_parameter("protocol_version", 1)
         self.declare_parameter("src", "ros2")
         self.declare_parameter("priority", 4)
@@ -66,9 +51,6 @@ class TbBridgeNode(Node):
         self.declare_parameter("send_rate_hz", 20.0)      # max send rate
         self.declare_parameter("reconnect_backoff_s", 1.0)
         self.declare_parameter("max_backoff_s", 10.0)
-
-        # SetStreams behavior
-        self.declare_parameter("set_streams_ack_timeout_s", 1.5)
 
         # Read parameters
         self.robot_id: str = self.get_parameter("robot_id").value
@@ -82,43 +64,38 @@ class TbBridgeNode(Node):
         self.reconnect_backoff_s: float = float(self.get_parameter("reconnect_backoff_s").value)
         self.max_backoff_s: float = float(self.get_parameter("max_backoff_s").value)
 
-        self.set_streams_ack_timeout_s: float = float(
-            self.get_parameter("set_streams_ack_timeout_s").value
-        )
-
-        # --- WS state / control ---
+        # --- Service state / WS state ---
+        self._next_cfg_id = 1
         self.ws_connected = False
-        self._shutdown_evt = threading.Event()
-
-        # Outbound queue (ROS thread -> WS thread)
-        self._tx_queue: "queue.Queue[str]" = queue.Queue()
-
-        # For "send on next connect" convenience (last-config-wins)
         self._pending_cfg_json: Optional[str] = None
 
-        # --- ACK waiters for SetStreams ---
-        self._next_cfg_id = 1
+        self._ack_waiters = {}          # cfg_id -> threading.Event
+        self._ack_results = {}          # cfg_id -> (ok: bool, msg: str)
         self._ack_lock = threading.Lock()
-        self._ack_waiters: Dict[int, threading.Event] = {}
-        self._ack_results: Dict[int, Tuple[bool, str]] = {}
 
-        # --- cmd_vel state ---
+
+        # --- State ---
         self._seq = 0
         self._latest_twist: Optional[TwistSample] = None
         self._latest_lock = threading.Lock()
+        self._shutdown_evt = threading.Event()
+        self._tx_queue: "queue.Queue[str]" = queue.Queue()
+
 
         # --- ROS interfaces ---
         topic = f"/{self.robot_id}/cmd_vel"
         self.create_subscription(Twist, topic, self._on_cmd_vel, 10)
         self.get_logger().info(f"Subscribed to {topic}")
 
-        self.create_service(SetStreams, f"/{self.robot_id}/set_streams", self.on_set_streams)
+        self.srv_set_streams = self.create_service(
+            SetStreams,
+            f"/{self.robot_id}/set_streams",
+            self.on_set_streams,
+        )
 
-        # --- WS thread ---
+        # --- Run WebSocket client loop in a background thread (asyncio) ---
         self._ws_thread = threading.Thread(target=self._ws_thread_main, daemon=True)
         self._ws_thread.start()
-
-        self.pub_motor_state = self.create_publisher(MotorState, f'/{self.robot_id}/motor_state', 10)
 
     # ---------------- ROS callbacks ----------------
 
@@ -133,17 +110,18 @@ class TbBridgeNode(Node):
 
     def on_set_streams(self, request, response):
         """
-        Send "cfg" over WS and wait for matching "ack".
-        If WS not connected, queue cfg for later and return ok=False.
+        Build a WS cfg command. If WS is connected, send immediately.
+        Otherwise queue it for send-on-connect.
         """
         cfg_id = self._next_cfg_id
         self._next_cfg_id += 1
 
-        # Register waiter before sending
         evt = threading.Event()
         with self._ack_lock:
             self._ack_waiters[cfg_id] = evt
+            # remove any stale result for this id (shouldn't exist, but safe)
             self._ack_results.pop(cfg_id, None)
+
 
         cmd: Dict[str, Any] = {
             "v": self.v,
@@ -159,34 +137,44 @@ class TbBridgeNode(Node):
             },
         }
 
-        # If your srv has lidar360 fields, include them too:
+        # Your srv appears to include these fields; include them if present.
         if hasattr(request, "lidar360") and hasattr(request, "lidar360_hz"):
-            cmd["streams"]["lidar360"] = {
-                "en": bool(getattr(request, "lidar360")),
-                "hz": float(getattr(request, "lidar360_hz")),
-            }
+            cmd["streams"]["lidar360"] = {"en": bool(request.lidar360), "hz": float(request.lidar360_hz)}
 
         cmd_json = json.dumps(cmd)
-        self._pending_cfg_json = cmd_json  # last-config-wins fallback
+        self._pending_cfg_json = cmd_json  # last-config-wins queue
+
         self.get_logger().info(f"CFG OUT: {cmd_json}")
 
-        # Always enqueue for WS thread send
+        # enqueue for immediate send (WS thread will send it if connected)
         self._tx_queue.put(cmd_json + "\n")
 
-        # If not connected, don't wait. (Still queued for next connect.)
+
+        # if self.ws_connected:
+        #     # WS loop will also pick up _pending_cfg_json on connect;
+        #     # here we report success in accepting the request.
+        #     response.ok = True
+        #     response.message = f"cfg queued id={cfg_id} (WS connected; will send now)"
+        # else:
+        #     response.ok = True
+        #     response.message = f"cfg queued id={cfg_id} (WS not connected; will send on connect)"
+        #     self.get_logger().warn("WS not connected; cfg queued for send-on-connect")
+
+        # return response
+    
+        # If WS isn't connected, don't wait; keep it queued for later.
+        
         if not self.ws_connected:
-            with self._ack_lock:
-                self._ack_waiters.pop(cfg_id, None)
-                self._ack_results.pop(cfg_id, None)
             response.ok = False
             response.message = f"WS not connected; cfg queued id={cfg_id}"
-            self.get_logger().warn(response.message)
             return response
 
-        # Wait for ACK
-        got = evt.wait(self.set_streams_ack_timeout_s)
+        # Wait for ACK (timeout seconds)
+        timeout_s = 1.5
+        got = evt.wait(timeout_s)
 
         with self._ack_lock:
+            # Clean up waiter regardless
             self._ack_waiters.pop(cfg_id, None)
             result = self._ack_results.pop(cfg_id, None)
 
@@ -212,6 +200,7 @@ class TbBridgeNode(Node):
         return self._seq
 
     def _json_dumps(self, obj: dict) -> str:
+        # compact JSON
         return json.dumps(obj, separators=(",", ":"))
 
     def _make_vel_msg(self, linear: float, angular: float) -> str:
@@ -243,12 +232,14 @@ class TbBridgeNode(Node):
     # ---------------- WebSocket loop ----------------
 
     def stop(self) -> None:
+        """Signal WS loop to exit."""
         self._shutdown_evt.set()
 
     def _ws_thread_main(self) -> None:
         try:
             asyncio.run(self._ws_main())
         except Exception as e:
+            # Don't crash ROS node because WS thread died
             try:
                 self.get_logger().error(f"WS thread fatal error: {e}")
             except Exception:
@@ -257,7 +248,7 @@ class TbBridgeNode(Node):
     async def _ws_recv_loop(self, ws) -> None:
         """
         Receives JSONL frames from TB and logs them.
-        Handles "ack" frames for SetStreams.
+        Later we will parse ACK + publish topics.
         """
         while not self._shutdown_evt.is_set():
             try:
@@ -272,42 +263,43 @@ class TbBridgeNode(Node):
             if isinstance(msg, bytes):
                 msg = msg.decode("utf-8", errors="ignore")
 
-            for line in str(msg).splitlines():
+            for line in msg.splitlines():
                 line = line.strip()
                 if not line:
                     continue
+                self.get_logger().info(f"WS IN: {line}")                
 
-                self.get_logger().info(f"WS IN: {line}")
-
-                # Parse JSON and handle ACK
                 try:
                     obj = json.loads(line)
                 except Exception:
                     continue
 
+                # if obj.get("type") == "ack":
+                #     self.get_logger().info(
+                #         f"ACK IN: id={obj.get('id')} ok={obj.get('ok')} msg={obj.get('msg')}"
+
+                #         with self._ack_lock:
+                #             self._ack_results[cfg_id] = (bool(obj.get("ok", False)), str(obj.get("msg", "")))
+                #             evt = self._ack_waiters.get(cfg_id)
+
+                #         if evt is not None:
+                #             evt.set()
+                #     )
+
                 if obj.get("type") == "ack":
-
-                    if obj.get("type") == "state" and obj.get("state") == "motors":
-                        msg = MotorState()
-                        msg.left_rads = float(obj.get("left_rads", 0.0))
-                        msg.right_rads = float(obj.get("right_rads", 0.0))
-                        msg.left_pwm = int(obj.get("left_pwm", 0))
-                        msg.right_pwm = int(obj.get("right_pwm", 0))
-                        self.pub_motor_state.publish(msg)
-
-
                     cfg_id = obj.get("id")
-                    ok = bool(obj.get("ok", False))
-                    msg_text = str(obj.get("msg", ""))
-
-                    self.get_logger().info(f"ACK IN: id={cfg_id} ok={ok} msg={msg_text}")
+                    self.get_logger().info(
+                        f"ACK IN: id={cfg_id} ok={obj.get('ok')} msg={obj.get('msg')}"
+                    )
 
                     if isinstance(cfg_id, int):
                         with self._ack_lock:
-                            self._ack_results[cfg_id] = (ok, msg_text)
+                            self._ack_results[cfg_id] = (bool(obj.get("ok", False)), str(obj.get("msg", "")))
                             evt = self._ack_waiters.get(cfg_id)
                         if evt is not None:
                             evt.set()
+
+
 
     async def _ws_main(self) -> None:
         backoff = self.reconnect_backoff_s
@@ -333,10 +325,10 @@ class TbBridgeNode(Node):
                     self.ws_connected = True
                     self.get_logger().info("WebSocket connected")
 
+                    # Start receiver
                     recv_task = asyncio.create_task(self._ws_recv_loop(ws))
 
-                    # If something was queued before connection, push it once.
-                    # (Queue already holds it too if service enqueued; this is just a safety net.)
+                    # Send pending cfg immediately on connect
                     if self._pending_cfg_json is not None:
                         try:
                             await ws.send(self._pending_cfg_json + "\n")
@@ -349,17 +341,23 @@ class TbBridgeNode(Node):
                     sent_stop_for_timeout = False
 
                     while not self._shutdown_evt.is_set():
-                        # If receiver died, treat as connection failure
-                        if recv_task is not None and recv_task.done():
-                            raise ConnectionError("WS recv loop ended")
 
-                        # Send queued outbound messages (cfg etc.)
+
+                        # Send any queued outgoing messages (cfg, later other things)
                         try:
                             while True:
                                 out = self._tx_queue.get_nowait()
                                 await ws.send(out)
+                                # Optional: debug log
+                                if out.startswith("{") and '"type":"cfg"' in out:
+                                    self.get_logger().info(f"CFG SENT: {out.strip()}")
                         except queue.Empty:
                             pass
+
+
+                        # If receiver died, treat as connection failure
+                        if recv_task is not None and recv_task.done():
+                            raise ConnectionError("WS recv loop ended")
 
                         now = time.monotonic()
 
