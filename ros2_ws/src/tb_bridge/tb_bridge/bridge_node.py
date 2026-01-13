@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""
-tb_bridge/bridge_node.py
+"""tb_bridge/bridge_node.py
 
-ROS2 <-> WebSocket JSONL bridge (v0/v1-ish)
+ROS2 <-> WebSocket JSONL bridge (v1)
 
 ROS -> WS:
 - Subscribes: /<robot_id>/cmd_vel (geometry_msgs/Twist)
 - Sends WS JSONL frames (one JSON per line, newline terminated)
-- Watchdog: if no cmd_vel for cmd_timeout_ms, sends STOP once
+- Watchdog: if no cmd_vel for cmd_timeout_ms, sends STOP once (including immediately on startup)
 - Reconnects automatically with backoff
 
 ROS Service -> WS (cfg):
@@ -19,7 +18,9 @@ ROS Service -> WS (cfg):
 WS -> ROS (receive):
 - Receives WS frames and logs "WS IN: ..."
 - Parses "ack" frames and wakes waiting service calls
-- (Sensor publishing not implemented yet; next step)
+- Publishes:
+    /<robot_id>/motor_state      (tb_msgs/MotorState) from state=motors
+    /<robot_id>/imu/data_raw     (sensor_msgs/Imu)   from state=imu
 
 Notes:
 - Uses a background thread running an asyncio WS client.
@@ -37,7 +38,10 @@ from typing import Optional, Dict, Any, Tuple
 
 import rclpy
 from rclpy.node import Node
+
 from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Imu
+
 from tb_msgs.srv import SetStreams
 from tb_msgs.msg import MotorState
 
@@ -63,7 +67,7 @@ class TbBridgeNode(Node):
         self.declare_parameter("priority", 4)
 
         self.declare_parameter("cmd_timeout_ms", 500)     # stop if stale
-        self.declare_parameter("send_rate_hz", 20.0)      # max send rate
+        self.declare_parameter("send_rate_hz", 20.0)      # send vel at this rate while fresh
         self.declare_parameter("reconnect_backoff_s", 1.0)
         self.declare_parameter("max_backoff_s", 10.0)
 
@@ -114,11 +118,16 @@ class TbBridgeNode(Node):
 
         self.create_service(SetStreams, f"/{self.robot_id}/set_streams", self.on_set_streams)
 
+        self.pub_motor_state = self.create_publisher(
+            MotorState, f"/{self.robot_id}/motor_state", 10
+        )
+        self.pub_imu = self.create_publisher(
+            Imu, f"/{self.robot_id}/imu/data_raw", 10
+        )
+
         # --- WS thread ---
         self._ws_thread = threading.Thread(target=self._ws_thread_main, daemon=True)
         self._ws_thread.start()
-
-        self.pub_motor_state = self.create_publisher(MotorState, f'/{self.robot_id}/motor_state', 10)
 
     # ---------------- ROS callbacks ----------------
 
@@ -132,8 +141,8 @@ class TbBridgeNode(Node):
             self._latest_twist = sample
 
     def on_set_streams(self, request, response):
-        """
-        Send "cfg" over WS and wait for matching "ack".
+        """Send "cfg" over WS and wait for matching "ack".
+
         If WS not connected, queue cfg for later and return ok=False.
         """
         cfg_id = self._next_cfg_id
@@ -159,7 +168,7 @@ class TbBridgeNode(Node):
             },
         }
 
-        # If your srv has lidar360 fields, include them too:
+        # If your srv has lidar360 fields, include them too
         if hasattr(request, "lidar360") and hasattr(request, "lidar360_hz"):
             cmd["streams"]["lidar360"] = {
                 "en": bool(getattr(request, "lidar360")),
@@ -200,9 +209,9 @@ class TbBridgeNode(Node):
             response.message = f"ack missing result id={cfg_id}"
             return response
 
-        ok, msg = result
+        ok, msg_text = result
         response.ok = bool(ok)
-        response.message = msg if msg else f"ack received id={cfg_id}"
+        response.message = msg_text if msg_text else f"ack received id={cfg_id}"
         return response
 
     # ---------------- Message building ----------------
@@ -255,9 +264,20 @@ class TbBridgeNode(Node):
                 pass
 
     async def _ws_recv_loop(self, ws) -> None:
-        """
-        Receives JSONL frames from TB and logs them.
-        Handles "ack" frames for SetStreams.
+        """Receives JSONL frames from TB.
+
+        Handles:
+        - ack: wakes waiting SetStreams call
+        - state motors: publishes MotorState
+        - state imu: publishes sensor_msgs/Imu
+
+        Expected motor frame (from firmware):
+          {"type":"state","state":"motors","left_rads":..,"right_rads":..,"left_pwm":..,"right_pwm":..}
+
+        Expected imu frame (you will add in firmware):
+          {"type":"state","state":"imu","ax":..,"ay":..,"az":..,"gx":..,"gy":..,"gz":..,
+           "qx":..,"qy":..,"qz":..,"qw":..}
+        (orientation fields optional; if missing, orientation_covariance[0] = -1)
         """
         while not self._shutdown_evt.is_set():
             try:
@@ -279,27 +299,18 @@ class TbBridgeNode(Node):
 
                 self.get_logger().info(f"WS IN: {line}")
 
-                # Parse JSON and handle ACK
                 try:
                     obj = json.loads(line)
                 except Exception:
                     continue
 
-                if obj.get("type") == "ack":
+                msg_type = obj.get("type")
 
-                    if obj.get("type") == "state" and obj.get("state") == "motors":
-                        msg = MotorState()
-                        msg.left_rads = float(obj.get("left_rads", 0.0))
-                        msg.right_rads = float(obj.get("right_rads", 0.0))
-                        msg.left_pwm = int(obj.get("left_pwm", 0))
-                        msg.right_pwm = int(obj.get("right_pwm", 0))
-                        self.pub_motor_state.publish(msg)
-
-
+                # --- ACK ---
+                if msg_type == "ack":
                     cfg_id = obj.get("id")
                     ok = bool(obj.get("ok", False))
                     msg_text = str(obj.get("msg", ""))
-
                     self.get_logger().info(f"ACK IN: id={cfg_id} ok={ok} msg={msg_text}")
 
                     if isinstance(cfg_id, int):
@@ -308,17 +319,61 @@ class TbBridgeNode(Node):
                             evt = self._ack_waiters.get(cfg_id)
                         if evt is not None:
                             evt.set()
+                    continue
+
+                # --- STATE ---
+                if msg_type == "state":
+                    state = obj.get("state")
+
+                    if state == "motors":
+                        try:
+                            m = MotorState()
+                            m.left_rads = float(obj.get("left_rads", 0.0))
+                            m.right_rads = float(obj.get("right_rads", 0.0))
+                            m.left_pwm = int(obj.get("left_pwm", 0))
+                            m.right_pwm = int(obj.get("right_pwm", 0))
+                            self.pub_motor_state.publish(m)
+                        except Exception as e:
+                            self.get_logger().warn(f"Failed to publish MotorState: {e}")
+
+                    elif state == "imu":
+                        try:
+                            imu = Imu()
+                            imu.header.stamp = self.get_clock().now().to_msg()
+                            imu.header.frame_id = f"{self.robot_id}/imu_link"
+
+                            # linear acceleration (m/s^2)
+                            imu.linear_acceleration.x = float(obj.get("ax", 0.0))
+                            imu.linear_acceleration.y = float(obj.get("ay", 0.0))
+                            imu.linear_acceleration.z = float(obj.get("az", 0.0))
+
+                            # angular velocity (rad/s)
+                            imu.angular_velocity.x = float(obj.get("gx", 0.0))
+                            imu.angular_velocity.y = float(obj.get("gy", 0.0))
+                            imu.angular_velocity.z = float(obj.get("gz", 0.0))
+
+                            # orientation optional
+                            if all(k in obj for k in ("qx", "qy", "qz", "qw")):
+                                imu.orientation.x = float(obj.get("qx", 0.0))
+                                imu.orientation.y = float(obj.get("qy", 0.0))
+                                imu.orientation.z = float(obj.get("qz", 0.0))
+                                imu.orientation.w = float(obj.get("qw", 1.0))
+                                # If you later provide covariances, fill them; for now leave defaults (0)
+                            else:
+                                # Unknown orientation
+                                imu.orientation_covariance[0] = -1.0
+
+                            self.pub_imu.publish(imu)
+                        except Exception as e:
+                            self.get_logger().warn(f"Failed to publish Imu: {e}")
 
     async def _ws_main(self) -> None:
         backoff = self.reconnect_backoff_s
         self.get_logger().info(f"WebSocket target: {self.ws_url}")
 
-        last_sent_linear = None
-        last_sent_angular = None
-        last_send_time = 0.0
         sent_stop_for_timeout = False
-
         send_period = 1.0 / max(self.send_rate_hz, 1.0)
+        last_send_time = 0.0
 
         while not self._shutdown_evt.is_set():
             recv_task = None
@@ -336,7 +391,6 @@ class TbBridgeNode(Node):
                     recv_task = asyncio.create_task(self._ws_recv_loop(ws))
 
                     # If something was queued before connection, push it once.
-                    # (Queue already holds it too if service enqueued; this is just a safety net.)
                     if self._pending_cfg_json is not None:
                         try:
                             await ws.send(self._pending_cfg_json + "\n")
@@ -345,8 +399,11 @@ class TbBridgeNode(Node):
                         except Exception as e:
                             self.get_logger().warn(f"Failed to send pending cfg on connect: {e}")
 
-                    backoff = self.reconnect_backoff_s
+                    # Keep the behavior: STOP immediately on startup/connect
                     sent_stop_for_timeout = False
+                    last_send_time = 0.0
+
+                    backoff = self.reconnect_backoff_s
 
                     while not self._shutdown_evt.is_set():
                         # If receiver died, treat as connection failure
@@ -366,11 +423,11 @@ class TbBridgeNode(Node):
                         with self._latest_lock:
                             latest = self._latest_twist
 
-                        # Watchdog: stop if stale
                         stale = (
                             latest is None
                             or (now - latest.t_monotonic) * 1000.0 > self.cmd_timeout_ms
                         )
+
                         if stale:
                             if not sent_stop_for_timeout:
                                 await ws.send(self._make_stop_msg() + "\n")
@@ -378,12 +435,11 @@ class TbBridgeNode(Node):
                                     f"cmd_vel timeout (> {self.cmd_timeout_ms} ms). Sent STOP."
                                 )
                                 sent_stop_for_timeout = True
-                                last_sent_linear = 0.0
-                                last_sent_angular = 0.0
                                 last_send_time = now
                             await asyncio.sleep(0.05)
                             continue
 
+                        # cmd_vel is fresh
                         sent_stop_for_timeout = False
 
                         # Rate limit
@@ -391,18 +447,9 @@ class TbBridgeNode(Node):
                             await asyncio.sleep(0.001)
                             continue
 
-                        # Suppress duplicates
-                        if (
-                            last_sent_linear is not None
-                            and abs(latest.linear - last_sent_linear) < 1e-6
-                            and abs(latest.angular - last_sent_angular) < 1e-6
-                        ):
-                            await asyncio.sleep(0.002)
-                            continue
-
+                        # IMPORTANT FIX:
+                        # Do NOT suppress duplicates. TB firmware has its own timeout; it needs refresh.
                         await ws.send(self._make_vel_msg(latest.linear, latest.angular) + "\n")
-                        last_sent_linear = latest.linear
-                        last_sent_angular = latest.angular
                         last_send_time = now
 
             except asyncio.CancelledError:

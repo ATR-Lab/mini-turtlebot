@@ -8,9 +8,8 @@
 #include <Adafruit_SSD1306.h>
 
 // -------------------- USER CONFIG --------------------
-static const char* WIFI_SSID = "Kim-Elecom-2G";
-static const char* WIFI_PASS = "discovery";
-
+static const char* WIFI_SSID = "Shaon";
+static const char* WIFI_PASS = "shA12345";
 static const uint16_t WS_PORT = 9000;
 
 // Robot kinematics (tune these)
@@ -76,6 +75,21 @@ static const float DEF_IMU_HZ      = 50.0f;
 static const float DEF_IR_HZ       = 10.0f;
 static const float DEF_LIDAR_HZ    = 5.0f;
 static const float DEF_LIDAR360_HZ = 5.0f;
+
+// -------------------- MPU6050 (raw I2C, no extra library) --------------------
+static const uint8_t MPU_ADDR = 0x68;
+
+// MPU registers
+static const uint8_t REG_PWR_MGMT_1 = 0x6B;
+static const uint8_t REG_ACCEL_XOUT_H = 0x3B;
+
+// Scale factors for default config:
+// Accel ±2g => 16384 LSB/g
+// Gyro  ±250 dps => 131 LSB/(deg/s)
+static const float ACC_LSB_PER_G = 16384.0f;
+static const float GYRO_LSB_PER_DPS = 131.0f;
+static const float G_TO_MSS = 9.80665f;
+static const float DEG_TO_RAD_F = 0.017453292519943295f;
 
 // -------------------- helpers ----------
 static int dutyFromNorm(float x) {
@@ -173,18 +187,9 @@ static void handleCmdVel(float linear_x, float angular_z) {
   g_right_pwm = (int)(right_norm * PWM_MAX);
 
   last_cmd_ms = millis();
-
-  Serial.print("[cmd_vel] v=");
-  Serial.print(linear_x, 3);
-  Serial.print(" w=");
-  Serial.print(angular_z, 3);
-  Serial.print(" -> L=");
-  Serial.print(left_norm, 3);
-  Serial.print(" R=");
-  Serial.println(right_norm, 3);
 }
 
-// -------------------- Outgoing JSONL helpers --------------------
+// -------------------- WS JSONL helpers --------------------
 static void wsTextAllJsonl(const JsonDocument& doc) {
   String out;
   serializeJson(doc, out);
@@ -198,6 +203,66 @@ static void wsTextClientJsonl(AsyncWebSocketClient* client, const JsonDocument& 
   serializeJson(doc, out);
   out += "\n";
   client->text(out);
+}
+
+// -------------------- MPU6050 low-level --------------------
+static bool mpuWriteReg(uint8_t reg, uint8_t value) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(value);
+  return (Wire.endTransmission() == 0);
+}
+
+static bool mpuReadBytes(uint8_t startReg, uint8_t* buf, size_t n) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(startReg);
+  if (Wire.endTransmission(false) != 0) return false;
+
+  size_t got = Wire.requestFrom((int)MPU_ADDR, (int)n, (int)true);
+  if (got != n) return false;
+
+  for (size_t i = 0; i < n; i++) buf[i] = Wire.read();
+  return true;
+}
+
+static bool mpuInit() {
+  // Wake up MPU6050 (clear sleep bit)
+  // PWR_MGMT_1 = 0x00
+  if (!mpuWriteReg(REG_PWR_MGMT_1, 0x00)) {
+    return false;
+  }
+  delay(50);
+  return true;
+}
+
+static bool mpuReadAccelGyro(float& ax_mss, float& ay_mss, float& az_mss,
+                             float& gx_rads, float& gy_rads, float& gz_rads) {
+  uint8_t b[14];
+  if (!mpuReadBytes(REG_ACCEL_XOUT_H, b, sizeof(b))) return false;
+
+  int16_t ax = (int16_t)((b[0] << 8) | b[1]);
+  int16_t ay = (int16_t)((b[2] << 8) | b[3]);
+  int16_t az = (int16_t)((b[4] << 8) | b[5]);
+  // temp: b[6..7] ignored
+  int16_t gx = (int16_t)((b[8] << 8) | b[9]);
+  int16_t gy = (int16_t)((b[10] << 8) | b[11]);
+  int16_t gz = (int16_t)((b[12] << 8) | b[13]);
+
+  // Convert accel to m/s^2
+  ax_mss = ((float)ax / ACC_LSB_PER_G) * G_TO_MSS;
+  ay_mss = ((float)ay / ACC_LSB_PER_G) * G_TO_MSS;
+  az_mss = ((float)az / ACC_LSB_PER_G) * G_TO_MSS;
+
+  // Convert gyro to rad/s
+  float gx_dps = ((float)gx / GYRO_LSB_PER_DPS);
+  float gy_dps = ((float)gy / GYRO_LSB_PER_DPS);
+  float gz_dps = ((float)gz / GYRO_LSB_PER_DPS);
+
+  gx_rads = gx_dps * DEG_TO_RAD_F;
+  gy_rads = gy_dps * DEG_TO_RAD_F;
+  gz_rads = gz_dps * DEG_TO_RAD_F;
+
+  return true;
 }
 
 // -------------------- Periodic publishers --------------------
@@ -237,11 +302,41 @@ static void publishMotorsIfDue() {
   wsTextAllJsonl(m);
 }
 
-// -------------------- cfg handler (ArduinoJson v7 safe) --------------------
+static void publishImuIfDue() {
+  if (!g_stream_imu.en || g_stream_imu.period_ms == 0) return;
+  uint32_t now = millis();
+  if (now - g_stream_imu.last_ms < g_stream_imu.period_ms) return;
+  g_stream_imu.last_ms = now;
+
+  float ax, ay, az, gx, gy, gz;
+  if (!mpuReadAccelGyro(ax, ay, az, gx, gy, gz)) {
+    // Don't spam; just skip if read fails
+    return;
+  }
+
+  StaticJsonDocument<256> j;
+  j["v"] = 1;
+  j["type"] = "state";
+  j["state"] = "imu";
+  j["ts_ms"] = now;
+
+  // accel (m/s^2)
+  j["ax"] = ax;
+  j["ay"] = ay;
+  j["az"] = az;
+
+  // gyro (rad/s)
+  j["gx"] = gx;
+  j["gy"] = gy;
+  j["gz"] = gz;
+
+  wsTextAllJsonl(j);
+}
+
+// -------------------- cfg handler --------------------
 static void handleCfg(AsyncWebSocketClient* client, const JsonDocument& doc) {
   int id = doc["id"] | 0;
 
-  // IMPORTANT: use JsonObjectConst; avoid JsonVariant assignment from JsonVariantConst
   JsonObjectConst sObj = doc["streams"].as<JsonObjectConst>();
   if (sObj.isNull()) {
     StaticJsonDocument<192> ack;
@@ -255,7 +350,6 @@ static void handleCfg(AsyncWebSocketClient* client, const JsonDocument& doc) {
   }
 
   auto upd = [&](const char* name, StreamCfg& cfg, float defhz) {
-    // v7-safe presence/type check
     if (!sObj[name].is<JsonObjectConst>()) return;
     JsonObjectConst o = sObj[name].as<JsonObjectConst>();
     bool en = o["en"] | false;
@@ -276,19 +370,13 @@ static void handleCfg(AsyncWebSocketClient* client, const JsonDocument& doc) {
   ack["ok"] = true;
   ack["msg"] = "streams updated";
   wsTextClientJsonl(client, ack);
-
-  Serial.printf("[cfg] id=%d motors(en=%d hz=%.1f) imu(en=%d hz=%.1f) ir(en=%d hz=%.1f) lidar(en=%d hz=%.1f)\n",
-                id,
-                (int)g_stream_motors.en, g_stream_motors.hz,
-                (int)g_stream_imu.en, g_stream_imu.hz,
-                (int)g_stream_ir.en, g_stream_ir.hz,
-                (int)g_stream_lidar.en, g_stream_lidar.hz);
 }
 
-// -------------------- WS events --------------------
+// -------------------- Message dispatcher (one JSON line) --------------------
 static void handleOneJsonLine(AsyncWebSocketClient* client, const String& line) {
   if (line.length() == 0) return;
 
+  // cfg has nested objects, give enough space
   StaticJsonDocument<768> doc;
   DeserializationError err = deserializeJson(doc, line);
   if (err) {
@@ -299,29 +387,24 @@ static void handleOneJsonLine(AsyncWebSocketClient* client, const String& line) 
   const char* type_s = doc["type"] | "";
   const char* cmd_s  = doc["cmd"]  | "";
 
-  // New protocol
   if (strcmp(type_s, "cmd") == 0) {
     if (strcmp(cmd_s, "vel") == 0) {
       float linear  = doc["linear"]  | 0.0f;
       float angular = doc["angular"] | 0.0f;
       handleCmdVel(linear, angular);
-    }
-    else if (strcmp(cmd_s, "stop") == 0) {
+    } else if (strcmp(cmd_s, "stop") == 0) {
       stopAll();
-    }
-    else if (strcmp(cmd_s, "estop") == 0) {
+    } else if (strcmp(cmd_s, "estop") == 0) {
       bool enabled = doc["enabled"] | true;
       if (enabled) stopAll();
-    }
-    else if (strcmp(cmd_s, "ping") == 0) {
+    } else if (strcmp(cmd_s, "ping") == 0) {
       StaticJsonDocument<128> ack;
       ack["v"] = 1;
       ack["type"] = "ack";
       ack["ok"] = true;
       ack["msg"] = "pong";
       wsTextClientJsonl(client, ack);
-    }
-    else {
+    } else {
       Serial.printf("[ws] unknown cmd: %s\n", cmd_s);
     }
   }
@@ -339,6 +422,7 @@ static void handleOneJsonLine(AsyncWebSocketClient* client, const String& line) 
   }
 }
 
+// -------------------- WS events --------------------
 void onWsEvent(AsyncWebSocket* server_,
                AsyncWebSocketClient* client,
                AwsEventType type,
@@ -365,7 +449,7 @@ void onWsEvent(AsyncWebSocket* server_,
   if (!info->final || info->index != 0 || info->len != len) return;
   if (info->opcode != WS_TEXT) return;
 
-  // Copy into a String
+  // Copy into String
   String msg;
   msg.reserve(len + 1);
   for (size_t i = 0; i < len; i++) msg += (char)data[i];
@@ -388,12 +472,20 @@ void setup() {
   delay(200);
   Serial.println("\n[boot] Mini Turtlebot ESP32");
 
-  // I2C OLED
+  // I2C OLED + IMU share the same bus
   Wire.begin(PIN_SDA, PIN_SCL); // SDA=A4, SCL=A5
+
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
     Serial.println("[oled] SSD1306 init failed");
   } else {
     drawStatus("Booting...");
+  }
+
+  // Init MPU6050
+  if (mpuInit()) {
+    Serial.println("[imu] MPU6050 init OK");
+  } else {
+    Serial.println("[imu] MPU6050 init FAIL (check wiring/address)");
   }
 
   // PWM setup
@@ -409,12 +501,12 @@ void setup() {
 
   stopAll();
 
-  // Default stream policy: motors ON, others OFF
-  setStream(g_stream_motors, true,  DEF_MOTORS_HZ, DEF_MOTORS_HZ);
-  setStream(g_stream_imu,    false, DEF_IMU_HZ,    DEF_IMU_HZ);
-  setStream(g_stream_ir,     false, DEF_IR_HZ,     DEF_IR_HZ);
-  setStream(g_stream_lidar,  false, DEF_LIDAR_HZ,  DEF_LIDAR_HZ);
-  setStream(g_stream_lidar360, false, DEF_LIDAR360_HZ, DEF_LIDAR360_HZ);
+  // Default streams: motors ON at 1Hz so you can see it, imu OFF by default
+  setStream(g_stream_motors, true,  1.0f, DEF_MOTORS_HZ);
+  setStream(g_stream_imu,    false, 0.0f, DEF_IMU_HZ);
+  setStream(g_stream_ir,     false, 0.0f, DEF_IR_HZ);
+  setStream(g_stream_lidar,  false, 0.0f, DEF_LIDAR_HZ);
+  setStream(g_stream_lidar360, false, 0.0f, DEF_LIDAR360_HZ);
 
   // WiFi
   WiFi.mode(WIFI_STA);
@@ -455,8 +547,9 @@ void loop() {
   // Always-on heartbeat
   publishHeartbeat();
 
-  // Gated streams (only motors implemented for now)
+  // Gated streams
   publishMotorsIfDue();
+  publishImuIfDue();
 
   // SAFETY WATCHDOG — STOP ONLY IF STALE
   static bool already_stopped = false;
@@ -471,5 +564,5 @@ void loop() {
     already_stopped = false;
   }
 
-  delay(20); // ~50 Hz loop
+  delay(5); // faster loop helps stream timing
 }
